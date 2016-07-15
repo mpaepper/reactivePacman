@@ -12,6 +12,7 @@ const SPEED = 120; // lower is faster
 const PACMAN_SPEED = 0.5;
 const GHOST_SPEED = 0.25;
 const GHOST_PROBABILITY_RANDOM = 0.2;
+const SCARE_TIME = 5000; // in miliseconds
 const DEBUG = 0;
 
 
@@ -39,10 +40,20 @@ function paintPellets(pellets) {
     });
 }
 
+function paintBonus(bonus) {
+    let img = document.getElementById("bonus");
+    bonus.forEach(function(position) {
+        ctx.drawImage(img, position.x, position.y);
+    });
+}
+
 function paintGhosts(ghosts) {
     ctx.fillStyle = '#FF0000';
     ghosts.forEach(function(ghost) {
         let img = document.getElementById("ghost-" + ghost.direction);
+        if (ghost.scared) {
+            img = document.getElementById("ghost-scared");
+        }
         ctx.drawImage(img, ghost.x, ghost.y);
         if (DEBUG) {
             ctx.fillText('x: ' + ghost.x + ' y: ' + ghost.y, ghost.x, ghost.y);
@@ -56,8 +67,11 @@ function paintBackground() {
 }
 
 function gameOver(pacman, ghosts) {
-    return ghosts.some(function(ghostPos) {
-        if (collision(pacman, ghostPos)) {
+    return ghosts.some(function(ghost) {
+        if (ghost.scared) {
+            return false;
+        }
+        if (collision(pacman, ghost)) {
             return true;
         }
         return false;
@@ -91,6 +105,7 @@ function renderGameOver() {
 function renderScene(actors) {
     paintBackground();
     paintPellets(actors.pellets);
+    paintBonus(actors.bonus);
     paintScore(actors.score);
     paintGhosts(actors.ghosts);
     paintPacman(actors.pacman);
@@ -246,63 +261,79 @@ const pellets$ = pacman$.scan(function(pellets, pacmanPos) {
     return getPositionsWithoutCollision(pellets, pacmanPos);
 }, createInitialRandomPositions(NUM_PELLETS)).distinctUntilChanged(createSumFromPositions);
 
-const ghosts$ = ticker$.withLatestFrom(pacman$)
-    .scan(function(ghostPositions, [ticker, pacmanPos]) {
+const bonus$ = pacman$.scan(function(bonusPositions, pacman) {
+    return getPositionsWithoutCollision(bonusPositions, pacman);
+}, createInitialRandomPositions(NUM_BONUS)).distinctUntilChanged(createSumFromPositions);
+
+const bonusTaken$ = bonus$.scan(function(prevNumber, bonus) {
+    return prevNumber + 1;
+}, -1).timestamp();
+
+const bonusEnd$ = bonusTaken$.skip(1).delay(SCARE_TIME).timestamp().startWith({
+    timestamp: 0
+});
+
+const ghosts$ = ticker$.withLatestFrom(pacman$, bonusTaken$, bonusEnd$)
+    .scan(function(ghostPositions, [ticker, pacmanPos, bonusTaken, bonusEnd]) {
+        let ghostSpeed = GHOST_SPEED;
+        let scared = false;
+        if (bonusTaken.value > 0 && bonusTaken.timestamp > bonusEnd.timestamp) {
+            scared = true;
+            ghostSpeed = 0.5 * ghostSpeed;
+        }
         let newPositions = [];
         ghostPositions.forEach(
             function(ghostPos) {
-                let moveType = Math.random();
                 let direction = '';
-                if (moveType > GHOST_PROBABILITY_RANDOM) {
-                    direction = getMoveTowards(ghostPos, pacmanPos);
+                if (scared) {
+                    if (collision(ghostPos, pacmanPos)) {
+                        // Put scared ghost touching pacman far away
+                        ghostPos.x = pacmanPos.x + 200;
+                        ghostPos.y = pacmanPos.y + 200;
+                    }
+                    direction = getMoveTowards(pacmanPos, ghostPos); // Move pacman needs to do to run towards ghost is the same as ghost running away from pacman
                 } else {
-                    direction = getRandomMove();
+                    if (Math.random() > GHOST_PROBABILITY_RANDOM) {
+                        direction = getMoveTowards(ghostPos, pacmanPos);
+                    } else {
+                        direction = getRandomMove();
+                    }
                 }
                 switch (direction) {
                     case 'up':
-                        newPositions.push({
-                            x: ghostPos.x,
-                            y: ghostPos.y + (-GHOST_SPEED * PACMAN_SIZE),
-                            direction: direction
-                        });
+                        xPos = ghostPos.x;
+                        yPos = ghostPos.y + (-ghostSpeed * PACMAN_SIZE);
                         break;
                     case 'down':
-                        newPositions.push({
-                            x: ghostPos.x,
-                            y: ghostPos.y + (GHOST_SPEED * PACMAN_SIZE),
-                            direction: direction
-                        });
+                        xPos = ghostPos.x,
+                            yPos = ghostPos.y + (ghostSpeed * PACMAN_SIZE);
                         break;
                     case 'left':
-                        newPositions.push({
-                            x: ghostPos.x + (-GHOST_SPEED * PACMAN_SIZE),
-                            y: ghostPos.y,
-                            direction: direction
-                        });
+                        xPos = ghostPos.x + (-ghostSpeed * PACMAN_SIZE);
+                        yPos = ghostPos.y;
                         break;
                     case 'right':
-                        newPositions.push({
-                            x: ghostPos.x + (GHOST_SPEED * PACMAN_SIZE),
-                            y: ghostPos.y,
-                            direction: direction
-                        });
+                        xPos = ghostPos.x + (ghostSpeed * PACMAN_SIZE);
+                        yPos = ghostPos.y;
                         break;
                 }
+                newPositions.push({
+                    x: xPos,
+                    y: yPos,
+                    direction: direction,
+                    scared: scared
+                });
             }
         );
         return newPositions;
     }, createInitialRandomPositions(NUM_GHOSTS));
 
-const bonus$ = pacman$.scan(function(bonusPositions, pacman) {
-    return getPositionsWithoutCollision(bonusPositions, pacman);
-}, createInitialRandomPositions(NUM_BONUS)).distinctUntilChanged(createSumFromPositions);
-
 const length$ = pellets$.scan(function(prevLength, apple) {
     return prevLength + 1;
-}, 1);
+}, -1);
 
-const score$ = length$.map(function(length) {
-    return Math.max(0, (length - 2) * 10);
+const score$ = length$.withLatestFrom(bonusTaken$).map(function([length, numBonus]) {
+    return Math.max(0, length * 10 + 100 * numBonus.value);
 });
 
 function renderError(error) {
@@ -310,13 +341,14 @@ function renderError(error) {
 }
 
 const game$ = Rx.Observable.combineLatest(
-        pacman$, pellets$, score$, ghosts$,
-        function(pacman, pellets, score, ghosts) {
+        pacman$, pellets$, score$, ghosts$, bonus$,
+        function(pacman, pellets, score, ghosts, bonus) {
             return {
                 pacman: pacman,
                 pellets: pellets,
                 score: score,
-                ghosts: ghosts
+                ghosts: ghosts,
+                bonus: bonus
             };
         })
     .sample(SPEED);
