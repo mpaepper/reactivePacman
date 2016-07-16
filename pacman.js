@@ -85,8 +85,8 @@ function collision(target1, target2) {
 
 function getRandomPosition() {
     return {
-        x: getRandomInt(0, canvas.width),
-        y: getRandomInt(0, canvas.height)
+        x: getRandomInt(0, canvas.width - PACMAN_SIZE),
+        y: getRandomInt(0, canvas.height - PACMAN_SIZE)
     };
 }
 
